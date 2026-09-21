@@ -344,16 +344,28 @@ impl PortalBackend {
             let session_manager = Arc::clone(&self.session_manager);
             let input_backend = Arc::clone(&self.input_backend);
             let dbus_conn = connection.clone();
+            let input_capture_tx = self.input_capture_tx.clone();
             tokio::spawn(async move {
                 Self::input_capture_activation_bridge(
                     dbus_conn,
                     session_manager,
                     input_backend,
+                    input_capture_tx,
                     activation_rx,
                 )
                 .await;
             });
         }
+
+        // EIS is socket-driven, unlike the Wayland event loop.  In
+        // particular, an InputCapture client performs its EIS handshake only
+        // after `ConnectToEIS` returns its fd.  Keep draining those sockets so
+        // that the receiver context reaches ActiveReceiver before a barrier
+        // tries to forward input to it.
+        let input_backend = Arc::clone(&self.input_backend);
+        tokio::spawn(async move {
+            Self::input_event_pump(input_backend).await;
+        });
 
         // Spawn periodic session cleanup task
         let session_manager = Arc::clone(&self.session_manager);
@@ -704,6 +716,7 @@ impl PortalBackend {
         connection: zbus::Connection,
         session_manager: Arc<Mutex<SessionManager>>,
         input_backend: Arc<Mutex<Box<dyn InputBackend>>>,
+        input_capture_tx: Option<mpsc::Sender<wayland::InputCaptureCommand>>,
         mut activation_rx: tokio::sync::mpsc::UnboundedReceiver<
             wayland::InputCaptureActivationEvent,
         >,
@@ -715,6 +728,7 @@ impl PortalBackend {
                 &connection,
                 &session_manager,
                 &input_backend,
+                input_capture_tx.as_ref(),
                 event,
             )
             .await;
@@ -729,6 +743,7 @@ impl PortalBackend {
         connection: &zbus::Connection,
         session_manager: &Arc<Mutex<SessionManager>>,
         input_backend: &Arc<Mutex<Box<dyn InputBackend>>>,
+        input_capture_tx: Option<&mpsc::Sender<wayland::InputCaptureCommand>>,
         event: wayland::InputCaptureActivationEvent,
     ) {
         use wayland::InputCaptureActivationEvent;
@@ -743,6 +758,7 @@ impl PortalBackend {
                     connection,
                     session_manager,
                     input_backend,
+                    input_capture_tx,
                     session_id,
                     barrier_id,
                     cursor_position,
@@ -759,6 +775,21 @@ impl PortalBackend {
                 let result =
                     backend.forward_captured_pointer_motion(&session_id, dx, dy, time_usec);
                 Self::log_forward_error(&session_id, "pointer motion", result);
+            }
+            InputCaptureActivationEvent::Button {
+                session_id,
+                button,
+                pressed,
+                time_usec,
+            } => {
+                let mut backend = input_backend.lock().await;
+                let result = backend.forward_captured_pointer_button(
+                    &session_id,
+                    button,
+                    pressed,
+                    time_usec,
+                );
+                Self::log_forward_error(&session_id, "pointer button", result);
             }
             InputCaptureActivationEvent::Key {
                 session_id,
@@ -836,6 +867,7 @@ impl PortalBackend {
         connection: &zbus::Connection,
         session_manager: &Arc<Mutex<SessionManager>>,
         input_backend: &Arc<Mutex<Box<dyn InputBackend>>>,
+        input_capture_tx: Option<&mpsc::Sender<wayland::InputCaptureCommand>>,
         session_id: String,
         barrier_id: u32,
         cursor_position: Option<(f64, f64)>,
@@ -875,6 +907,16 @@ impl PortalBackend {
             if let Some(session) = manager.get_session_mut(&handle) {
                 let _ = session.end_input_capture_activation();
             }
+            // The Wayland thread has already received the pointer-lock event.
+            // Roll it back too: leaving an unready EIS receiver holding the
+            // lock makes the local desktop appear frozen until the client is
+            // killed.
+            if let Some(tx) = input_capture_tx {
+                let _ = tx.send(wayland::InputCaptureCommand::ReleaseActiveLock {
+                    session_id: session_id.clone(),
+                    preserve_barrier_lock: false,
+                });
+            }
             return;
         }
 
@@ -900,6 +942,28 @@ impl PortalBackend {
             activation_id,
             "InputCapture activated"
         );
+    }
+
+    /// Drain EIS sockets often enough to complete client handshakes and to
+    /// process lifecycle acknowledgements such as `ei_device.ready()`.
+    ///
+    /// The individual sockets are non-blocking, so this is cheap while no
+    /// Deskflow session is connected.  A short interval also keeps the
+    /// `ConnectToEIS` → barrier-enable sequence responsive without tying EIS
+    /// processing to unrelated D-Bus or Wayland traffic.
+    async fn input_event_pump(input_backend: Arc<Mutex<Box<dyn InputBackend>>>) {
+        use tokio::time::{Duration, MissedTickBehavior};
+
+        let mut interval = tokio::time::interval(Duration::from_millis(5));
+        interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
+
+        loop {
+            interval.tick().await;
+            let mut backend = input_backend.lock().await;
+            if let Err(e) = backend.process_events() {
+                tracing::warn!(error = %e, "Failed to process input backend events");
+            }
+        }
     }
 
     /// Handle a `Deactivated` event: end the session's activation (if one

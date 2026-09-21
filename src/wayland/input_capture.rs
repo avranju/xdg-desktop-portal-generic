@@ -3,8 +3,8 @@
 //! Creates invisible `wlr-layer-shell-v1` surfaces positioned at each
 //! accepted [`PointerBarrier`], drives the `configure -> ack_configure ->
 //! attach buffer -> commit` mapping lifecycle so the surfaces genuinely map
-//! on a live compositor, and tears them down on `Disable`/`Release`/session
-//! close (Phase 2a). Locks the pointer on entry
+//! on a live compositor, and tears them down on `Disable`/session close
+//! (Phase 2a). Locks the pointer on entry
 //! (`zwp_pointer_constraints_v1`), reads relative motion once locked
 //! (`zwp_relative_pointer_v1`), and reports activation/motion/deactivation
 //! to the async D-Bus/EIS bridge task over [`InputCaptureActivationEvent`]
@@ -82,6 +82,17 @@ pub enum InputCaptureActivationEvent {
         /// Event timestamp in microseconds.
         time_usec: u64,
     },
+    /// A pointer button was pressed or released while capture is active.
+    Button {
+        /// Session handle (as a string).
+        session_id: String,
+        /// Linux evdev button code (`BTN_LEFT`, `BTN_RIGHT`, ...).
+        button: u32,
+        /// `true` if pressed, `false` if released.
+        pressed: bool,
+        /// Event timestamp in microseconds.
+        time_usec: u64,
+    },
     /// A key was pressed or released while a lock is active.
     Key {
         /// Session handle (as a string).
@@ -151,6 +162,54 @@ pub struct CachedKeymap {
 /// needs *some* thickness for the compositor to deliver pointer-enter
 /// events at all.
 const BARRIER_STRIP_THICKNESS_PX: u32 = 2;
+
+/// Output edge on which a pointer barrier lies.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BarrierSide {
+    Left,
+    Right,
+    Top,
+    Bottom,
+}
+
+impl BarrierSide {
+    /// Whether a relative-motion sample is trying to cross this edge.
+    fn is_outward(self, dx: f64, dy: f64) -> bool {
+        match self {
+            Self::Left => dx < 0.0,
+            Self::Right => dx > 0.0,
+            Self::Top => dy < 0.0,
+            Self::Bottom => dy > 0.0,
+        }
+    }
+
+    /// Put the reported activation point on the last in-zone pixel adjacent
+    /// to the logical barrier. Deskflow uses this coordinate to calculate
+    /// the destination entry point, so reporting the out-of-zone coordinate
+    /// on right/bottom edges introduces an avoidable offset.
+    fn project_to_zone_edge(self, coordinate: i32, position: &mut (f64, f64)) {
+        match self {
+            Self::Left => position.0 = f64::from(coordinate),
+            Self::Right => position.0 = f64::from(coordinate.saturating_sub(1)),
+            Self::Top => position.1 = f64::from(coordinate),
+            Self::Bottom => position.1 = f64::from(coordinate.saturating_sub(1)),
+        }
+    }
+}
+
+/// Translate compositor-global coordinates into the top-left-normalized
+/// coordinate space advertised by the receiver EIS regions.
+fn normalize_cursor_position(
+    position: Option<(f64, f64)>,
+    coordinate_origin: (i32, i32),
+) -> Option<(f64, f64)> {
+    position.map(|(x, y)| {
+        (
+            x - f64::from(coordinate_origin.0),
+            y - f64::from(coordinate_origin.1),
+        )
+    })
+}
 
 /// A barrier's computed layer-shell surface placement.
 ///
@@ -308,6 +367,15 @@ pub struct BarrierSurface {
     /// Live relative-pointer object, present only once the lock has
     /// actually activated (`Locked`).
     pub relative_pointer: Option<ZwpRelativePointerV1>,
+    /// Whether the compositor lock currently represents an active portal
+    /// capture. `Release` without a cursor position leaves the low-level
+    /// lock alive with this false so the next outward sample can re-arm the
+    /// logical barrier without waiting for a new `wl_pointer.Enter`.
+    pub capture_active: bool,
+    /// Output edge represented by this barrier.
+    barrier_side: BarrierSide,
+    /// Global x (vertical edge) or y (horizontal edge) of the barrier.
+    barrier_coordinate: i32,
     /// Whether entering this barrier should also grab exclusive keyboard
     /// focus (the session negotiated `KEYBOARD` capability).
     pub grab_keyboard: bool,
@@ -318,6 +386,11 @@ pub struct BarrierSurface {
     /// `wl_pointer.Enter`'s surface-local coordinates plus `origin`, then
     /// accumulated by each relative-motion sample while locked.
     pub last_cursor_position: Option<(f64, f64)>,
+    /// Top-left of the compositor's InputCapture zone layout. Receiver EIS
+    /// regions are normalized by this amount because their offsets are
+    /// unsigned; D-Bus activation positions must use the same coordinate
+    /// space or clients calculate the wrong destination entry position.
+    coordinate_origin: (i32, i32),
     /// Live `zwp_text_input_v3` object, present only while this surface
     /// holds real keyboard focus and `text_input_manager` is bound (see
     /// [`InputCaptureBarrierState::on_keyboard_enter`]).
@@ -431,6 +504,11 @@ impl InputCaptureBarrierState {
             );
             return;
         };
+        let coordinate_origin = zones
+            .iter()
+            .map(|(_, zone)| (zone.x, zone.y))
+            .reduce(|(min_x, min_y), (x, y)| (min_x.min(x), min_y.min(y)))
+            .unwrap_or((0, 0));
 
         for barrier in barriers {
             let Some(geometry) = barrier_to_layer_geometry(barrier, zones) else {
@@ -490,9 +568,33 @@ impl InputCaptureBarrierState {
                     shm_buffer: None,
                     locked_pointer: None,
                     relative_pointer: None,
+                    capture_active: false,
+                    barrier_side: if barrier.x1 == barrier.x2 {
+                        if geometry
+                            .anchor
+                            .contains(zwlr_layer_surface_v1::Anchor::Right)
+                        {
+                            BarrierSide::Right
+                        } else {
+                            BarrierSide::Left
+                        }
+                    } else if geometry
+                        .anchor
+                        .contains(zwlr_layer_surface_v1::Anchor::Bottom)
+                    {
+                        BarrierSide::Bottom
+                    } else {
+                        BarrierSide::Top
+                    },
+                    barrier_coordinate: if barrier.x1 == barrier.x2 {
+                        barrier.x1
+                    } else {
+                        barrier.y1
+                    },
                     grab_keyboard,
                     origin: geometry.origin,
                     last_cursor_position: None,
+                    coordinate_origin,
                     text_input: None,
                     text_commit_buffer: TextCommitBuffer::default(),
                 },
@@ -602,11 +704,28 @@ impl InputCaptureBarrierState {
     /// mapped so they can re-trigger later. Distinct from `destroy_session`
     /// (`Disable`/close), which tears the surfaces down entirely --
     /// `Release` per spec ends only the current activation.
-    pub fn release_active_locks(&mut self, session_id: &str) {
+    pub fn release_active_locks(&mut self, session_id: &str, preserve_barrier_lock: bool) {
+        let mut clear_keyboard_focus = false;
         for surface in self.surfaces.values_mut() {
             if surface.session_id == session_id {
-                destroy_lock_objects_mut(surface);
+                if preserve_barrier_lock
+                    && surface.capture_active
+                    && surface.relative_pointer.is_some()
+                {
+                    suspend_capture_mut(surface);
+                    tracing::debug!(
+                        session_id = %session_id,
+                        barrier_id = surface.barrier_id,
+                        "InputCapture barrier re-armed in place"
+                    );
+                } else {
+                    clear_keyboard_focus |= surface.capture_active;
+                    destroy_lock_objects_mut(surface);
+                }
             }
+        }
+        if clear_keyboard_focus {
+            self.keyboard_focus = None;
         }
     }
 
@@ -672,6 +791,16 @@ impl InputCaptureBarrierState {
             (session_id.clone(), barrier_id),
         );
         barrier_surface.locked_pointer = Some(locked);
+        if barrier_surface.grab_keyboard {
+            // Request focus as soon as the edge is entered. Deskflow releases
+            // its first activation within a few milliseconds; waiting for the
+            // Locked round-trip can make the Exclusive -> None -> Exclusive
+            // commits collapse into no observable keyboard-focus transition.
+            barrier_surface.layer_surface.set_keyboard_interactivity(
+                zwlr_layer_surface_v1::KeyboardInteractivity::Exclusive,
+            );
+            barrier_surface.wl_surface.commit();
+        }
         tracing::debug!(session_id = %session_id, barrier_id, "Pointer lock requested");
     }
 
@@ -688,6 +817,12 @@ impl InputCaptureBarrierState {
         if barrier_surface.relative_pointer.is_none() {
             if let Some(locked) = barrier_surface.locked_pointer.take() {
                 locked.destroy();
+            }
+            if barrier_surface.grab_keyboard {
+                barrier_surface
+                    .layer_surface
+                    .set_keyboard_interactivity(zwlr_layer_surface_v1::KeyboardInteractivity::None);
+                barrier_surface.wl_surface.commit();
             }
         }
     }
@@ -717,6 +852,7 @@ impl InputCaptureBarrierState {
         let relative_pointer =
             relative_pointer_manager.get_relative_pointer(pointer, qh, key.clone());
         barrier_surface.relative_pointer = Some(relative_pointer);
+        barrier_surface.capture_active = true;
 
         if barrier_surface.grab_keyboard {
             barrier_surface.layer_surface.set_keyboard_interactivity(
@@ -724,7 +860,15 @@ impl InputCaptureBarrierState {
             );
             barrier_surface.wl_surface.commit();
         }
-        let cursor_position = barrier_surface.last_cursor_position;
+        if let Some(position) = &mut barrier_surface.last_cursor_position {
+            barrier_surface
+                .barrier_side
+                .project_to_zone_edge(barrier_surface.barrier_coordinate, position);
+        }
+        let cursor_position = normalize_cursor_position(
+            barrier_surface.last_cursor_position,
+            barrier_surface.coordinate_origin,
+        );
 
         tracing::info!(session_id = %session_id, barrier_id, "InputCapture barrier activated");
         self.send_activation_event(InputCaptureActivationEvent::Activated {
@@ -739,21 +883,28 @@ impl InputCaptureBarrierState {
     /// objects and report `Deactivated`.
     pub fn on_unlocked(&mut self, session_id: &str, barrier_id: u32) {
         let mut cursor_position = None;
+        let mut was_active = false;
         if let Some(barrier_surface) = self.surfaces.get_mut(&(session_id.to_string(), barrier_id))
         {
-            cursor_position = barrier_surface.last_cursor_position;
+            cursor_position = normalize_cursor_position(
+                barrier_surface.last_cursor_position,
+                barrier_surface.coordinate_origin,
+            );
+            was_active = barrier_surface.capture_active;
             destroy_lock_objects_mut(barrier_surface);
         }
         if self.keyboard_focus.as_ref() == Some(&(session_id.to_string(), barrier_id)) {
             self.keyboard_focus = None;
         }
 
-        tracing::info!(session_id = %session_id, barrier_id, "InputCapture barrier deactivated");
-        self.send_activation_event(InputCaptureActivationEvent::Deactivated {
-            session_id: session_id.to_string(),
-            barrier_id,
-            cursor_position,
-        });
+        if was_active {
+            tracing::info!(session_id = %session_id, barrier_id, "InputCapture barrier deactivated");
+            self.send_activation_event(InputCaptureActivationEvent::Deactivated {
+                session_id: session_id.to_string(),
+                barrier_id,
+                cursor_position,
+            });
+        }
     }
 
     /// Handle `zwp_relative_pointer_v1.RelativeMotion`: accumulate onto the
@@ -766,17 +917,95 @@ impl InputCaptureBarrierState {
         dy: f64,
         time_usec: u64,
     ) {
-        if let Some(barrier_surface) = self.surfaces.get_mut(&(session_id.to_string(), barrier_id))
-        {
+        let key = (session_id.to_string(), barrier_id);
+        let mut reactivate_at = None;
+        let mut forward_motion = false;
+        let mut release_lock = false;
+
+        if let Some(barrier_surface) = self.surfaces.get_mut(&key) {
+            if barrier_surface.relative_pointer.is_none() {
+                return;
+            }
+
             if let Some((x, y)) = &mut barrier_surface.last_cursor_position {
                 *x += dx;
                 *y += dy;
             }
+
+            if barrier_surface.capture_active {
+                forward_motion = true;
+            } else if barrier_surface.barrier_side.is_outward(dx, dy) {
+                barrier_surface.capture_active = true;
+                if let Some(position) = &mut barrier_surface.last_cursor_position {
+                    barrier_surface
+                        .barrier_side
+                        .project_to_zone_edge(barrier_surface.barrier_coordinate, position);
+                }
+                if barrier_surface.grab_keyboard {
+                    barrier_surface.layer_surface.set_keyboard_interactivity(
+                        zwlr_layer_surface_v1::KeyboardInteractivity::Exclusive,
+                    );
+                    barrier_surface.wl_surface.commit();
+                }
+                reactivate_at = normalize_cursor_position(
+                    barrier_surface.last_cursor_position,
+                    barrier_surface.coordinate_origin,
+                );
+                forward_motion = true;
+            } else {
+                // Release consumed the portal activation. If the user is no
+                // longer pushing through this edge (inward or parallel
+                // motion), give the compositor its pointer back immediately.
+                destroy_lock_objects_mut(barrier_surface);
+                release_lock = true;
+            }
+        } else {
+            return;
         }
-        self.send_activation_event(InputCaptureActivationEvent::Motion {
-            session_id: session_id.to_string(),
-            dx,
-            dy,
+
+        if release_lock {
+            if self.keyboard_focus.as_ref() == Some(&key) {
+                self.keyboard_focus = None;
+            }
+            return;
+        }
+
+        if let Some(cursor_position) = reactivate_at {
+            tracing::info!(
+                session_id = %session_id,
+                barrier_id,
+                "InputCapture barrier reactivated by outward motion"
+            );
+            self.send_activation_event(InputCaptureActivationEvent::Activated {
+                session_id: session_id.to_string(),
+                barrier_id,
+                cursor_position: Some(cursor_position),
+            });
+        }
+        if forward_motion {
+            self.send_activation_event(InputCaptureActivationEvent::Motion {
+                session_id: session_id.to_string(),
+                dx,
+                dy,
+                time_usec,
+            });
+        }
+    }
+
+    /// Handle a `wl_pointer.Button` event while one of the barrier surfaces
+    /// owns the locked pointer focus.
+    pub fn on_pointer_button(&self, button: u32, pressed: bool, time_usec: u64) {
+        let Some(surface) = self
+            .surfaces
+            .values()
+            .find(|surface| surface.capture_active && surface.relative_pointer.is_some())
+        else {
+            return;
+        };
+        self.send_activation_event(InputCaptureActivationEvent::Button {
+            session_id: surface.session_id.clone(),
+            button,
+            pressed,
             time_usec,
         });
     }
@@ -849,6 +1078,10 @@ impl InputCaptureBarrierState {
         let Some(barrier_surface) = self.surfaces.get_mut(&key) else {
             return;
         };
+        if !barrier_surface.capture_active {
+            barrier_surface.text_commit_buffer.clear();
+            return;
+        }
         let Some(text) = barrier_surface.text_commit_buffer.on_done() else {
             return;
         };
@@ -860,11 +1093,11 @@ impl InputCaptureBarrierState {
 
     /// Handle `wl_keyboard.Key` while a barrier surface holds focus.
     pub fn on_keyboard_key(&self, keycode: u32, pressed: bool, time_usec: u64) {
-        let Some((session_id, _)) = &self.keyboard_focus else {
+        let Some(surface) = self.active_keyboard_surface() else {
             return;
         };
         self.send_activation_event(InputCaptureActivationEvent::Key {
-            session_id: session_id.clone(),
+            session_id: surface.session_id.clone(),
             keycode,
             pressed,
             time_usec,
@@ -873,16 +1106,32 @@ impl InputCaptureBarrierState {
 
     /// Handle `wl_keyboard.Modifiers` while a barrier surface holds focus.
     pub fn on_keyboard_modifiers(&self, depressed: u32, latched: u32, locked: u32, group: u32) {
-        let Some((session_id, _)) = &self.keyboard_focus else {
+        let Some(surface) = self.active_keyboard_surface() else {
             return;
         };
         self.send_activation_event(InputCaptureActivationEvent::Modifiers {
-            session_id: session_id.clone(),
+            session_id: surface.session_id.clone(),
             depressed,
             latched,
             locked,
             group,
         });
+    }
+
+    /// Resolve the active keyboard-capture surface. Prefer the surface from
+    /// the last real `wl_keyboard.Enter`, but fall back to the single active
+    /// barrier: a rapid release/re-arm can be coalesced by the compositor and
+    /// therefore produce no second Enter even though key events continue.
+    fn active_keyboard_surface(&self) -> Option<&BarrierSurface> {
+        self.keyboard_focus
+            .as_ref()
+            .and_then(|key| self.surfaces.get(key))
+            .filter(|surface| surface.capture_active && surface.grab_keyboard)
+            .or_else(|| {
+                self.surfaces
+                    .values()
+                    .find(|surface| surface.capture_active && surface.grab_keyboard)
+            })
     }
 
     /// Send an activation-lifecycle event to the async bridge task, if one
@@ -901,16 +1150,20 @@ impl InputCaptureBarrierState {
 /// Wayland protocol object hygiene only -- callers handle any
 /// D-Bus-visible deactivation separately.
 fn destroy_lock_objects_mut(surface: &mut BarrierSurface) {
-    let was_active = surface.relative_pointer.is_some();
+    suspend_capture_mut(surface);
+    destroy_text_input_mut(surface);
     if let Some(relative_pointer) = surface.relative_pointer.take() {
         relative_pointer.destroy();
     }
     if let Some(locked) = surface.locked_pointer.take() {
         locked.destroy();
     }
-    // Release() tears the lock down without waiting for a real Unlocked
-    // event -- this is the only place that reliably reverts a grabbed
-    // keyboard focus in that path, so it must not be skipped.
+}
+
+/// End the portal-visible capture while retaining any low-level pointer
+/// constraint. This is the re-armed state used for a position-less Release.
+fn suspend_capture_mut(surface: &mut BarrierSurface) {
+    let was_active = std::mem::replace(&mut surface.capture_active, false);
     if was_active && surface.grab_keyboard {
         surface
             .layer_surface
@@ -981,6 +1234,44 @@ mod tests {
         buf.on_commit_string(Some("discarded".to_string()));
         buf.clear();
         assert_eq!(buf.on_done(), None);
+    }
+
+    #[test]
+    fn test_barrier_side_outward_motion() {
+        assert!(BarrierSide::Left.is_outward(-1.0, 0.0));
+        assert!(BarrierSide::Right.is_outward(1.0, 0.0));
+        assert!(BarrierSide::Top.is_outward(0.0, -1.0));
+        assert!(BarrierSide::Bottom.is_outward(0.0, 1.0));
+
+        assert!(!BarrierSide::Left.is_outward(1.0, 0.0));
+        assert!(!BarrierSide::Right.is_outward(-1.0, 0.0));
+        assert!(!BarrierSide::Top.is_outward(0.0, 1.0));
+        assert!(!BarrierSide::Bottom.is_outward(0.0, -1.0));
+        assert!(!BarrierSide::Right.is_outward(0.0, 4.0));
+    }
+
+    #[test]
+    fn test_barrier_side_projects_activation_position() {
+        let mut vertical = (2557.5, 400.0);
+        BarrierSide::Right.project_to_zone_edge(2560, &mut vertical);
+        assert_eq!(vertical, (2559.0, 400.0));
+
+        let mut horizontal = (800.0, 1078.5);
+        BarrierSide::Bottom.project_to_zone_edge(1080, &mut horizontal);
+        assert_eq!(horizontal, (800.0, 1079.0));
+    }
+
+    #[test]
+    fn test_cursor_position_uses_receiver_eis_origin() {
+        assert_eq!(
+            normalize_cursor_position(Some((3839.0, 700.0)), (1280, 0)),
+            Some((2559.0, 700.0))
+        );
+        assert_eq!(
+            normalize_cursor_position(Some((-1.0, 100.0)), (-2560, -200)),
+            Some((2559.0, 300.0))
+        );
+        assert_eq!(normalize_cursor_position(None, (1280, 0)), None);
     }
 
     fn zone(x: i32, y: i32, width: u32, height: u32) -> InputCaptureZone {
