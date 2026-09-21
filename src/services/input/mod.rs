@@ -231,6 +231,22 @@ pub trait InputBackend: Send + Sync {
         })
     }
 
+    /// Forward one pointer-button press/release to the EIS client for
+    /// `session_id` while capture is active.
+    fn forward_captured_pointer_button(
+        &mut self,
+        session_id: &str,
+        button: u32,
+        pressed: bool,
+        time_usec: u64,
+    ) -> Result<()> {
+        let _ = (session_id, button, pressed, time_usec);
+        Err(PortalError::InvalidState {
+            expected: "EIS backend with an active receiver-context session".to_string(),
+            actual: "this backend has no InputCapture activation support".to_string(),
+        })
+    }
+
     /// Notify the connected EIS client for `session_id` that captured
     /// input has stopped (`InputCapture.Deactivated`). Same default-error
     /// rationale as [`Self::start_input_capture`].

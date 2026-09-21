@@ -722,6 +722,19 @@ impl InputBackend for EisBridgeBackend {
             .send_pointer_motion(dx, dy, time_usec)
     }
 
+    fn forward_captured_pointer_button(
+        &mut self,
+        session_id: &str,
+        button: u32,
+        pressed: bool,
+        time_usec: u64,
+    ) -> Result<()> {
+        self.sessions
+            .get_mut(session_id)
+            .ok_or_else(|| PortalError::SessionNotFound(session_id.to_string()))?
+            .send_pointer_button(button, pressed, time_usec)
+    }
+
     fn stop_input_capture(&mut self, session_id: &str) -> Result<()> {
         self.sessions
             .get_mut(session_id)

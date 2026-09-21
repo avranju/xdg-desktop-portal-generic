@@ -246,6 +246,25 @@ impl InputCaptureInterface {
         Some((x1, y1, x2, y2))
     }
 
+    /// Extract a `(f64, f64)` tuple from an options-style value.
+    fn get_option_f64_tuple2(
+        options: &HashMap<String, OwnedValue>,
+        key: &str,
+    ) -> Option<(f64, f64)> {
+        let v = options.get(key)?;
+        let value: &Value<'_> = v.downcast_ref().ok()?;
+        let Value::Structure(s) = value else {
+            return None;
+        };
+        let fields = s.fields();
+        if fields.len() != 2 {
+            return None;
+        }
+        let x = f64::try_from(&fields[0]).ok()?;
+        let y = f64::try_from(&fields[1]).ok()?;
+        Some((x, y))
+    }
+
     /// Validate that a session exists, belongs to the caller, and was
     /// created via `InputCapture` (not `RemoteDesktop`/`ScreenCast`).
     fn validate_input_capture_session(
@@ -801,6 +820,22 @@ impl InputCaptureInterface {
 
         let cursor_position = self.current_cursor_position(&session_handle.to_string());
 
+        // `end_input_capture_activation()` prevents the later Wayland
+        // `Unlocked` notification from ending this activation a second time,
+        // so terminate the matching EIS transaction here.  Otherwise the
+        // receiver remains in its emulating state and the next barrier hit
+        // sends a second `start_emulating`, which libei correctly rejects.
+        if activation_id.is_some() {
+            let mut backend = self.input_backend.lock().await;
+            if let Err(e) = backend.stop_input_capture(session_handle.as_str()) {
+                tracing::warn!(
+                    session_id = %session_handle,
+                    error = %e,
+                    "Failed to stop EIS input capture while disabling"
+                );
+            }
+        }
+
         if let Some(tx) = &self.input_capture_tx {
             let _ = tx.send(InputCaptureCommand::DestroySession {
                 session_id: session_handle.to_string(),
@@ -842,9 +877,7 @@ impl InputCaptureInterface {
         app_id: &str,
         options: HashMap<String, OwnedValue>,
         #[zbus(header)] header: zbus::message::Header<'_>,
-        #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
     ) -> zbus::fdo::Result<()> {
-        let _ = &options;
         let sender = header
             .sender()
             .ok_or_else(|| zbus::fdo::Error::Failed("Missing sender".to_string()))?
@@ -859,24 +892,42 @@ impl InputCaptureInterface {
         let activation_id = session.end_input_capture_activation();
         drop(manager);
 
-        let cursor_position = self.current_cursor_position(&session_handle.to_string());
+        // A client supplies cursor_position when it is returning from the
+        // remote desktop and wants the local pointer placed explicitly. In
+        // that case the compositor lock must really be released. Without a
+        // position, keep the low-level edge lock armed so another outward
+        // sample can re-trigger the logical barrier immediately.
+        let preserve_barrier_lock =
+            Self::get_option_f64_tuple2(&options, "cursor_position").is_none();
+
+        // Release ends the current portal activation synchronously.  The
+        // resulting Wayland `Unlocked` event is deliberately ignored by the
+        // activation bridge (the session no longer has an activation id), so
+        // the corresponding EIS `stop_emulating` must be sent here before a
+        // newly armed barrier can trigger another `start_emulating`.
+        if activation_id.is_some() {
+            let mut backend = self.input_backend.lock().await;
+            if let Err(e) = backend.stop_input_capture(session_handle.as_str()) {
+                tracing::warn!(
+                    session_id = %session_handle,
+                    error = %e,
+                    "Failed to stop EIS input capture while releasing"
+                );
+            }
+        }
 
         if let Some(tx) = &self.input_capture_tx {
             let _ = tx.send(InputCaptureCommand::ReleaseActiveLock {
                 session_id: session_handle.to_string(),
+                preserve_barrier_lock,
             });
         }
 
-        if let Some(activation_id) = activation_id {
-            let _ = Self::deactivated(
-                &emitter,
-                session_handle.to_owned(),
-                deactivated_options(activation_id, cursor_position),
-            )
-            .await;
-        }
-
-        tracing::debug!(session_id = %session_handle, "InputCapture.Release");
+        tracing::debug!(
+            session_id = %session_handle,
+            preserve_barrier_lock,
+            "InputCapture.Release"
+        );
         Ok(())
     }
 
@@ -1208,6 +1259,16 @@ mod tests {
         let options = HashMap::new();
         let parsed = InputCaptureInterface::get_option_i32_tuple4(&options, "position");
         assert_eq!(parsed, None);
+    }
+
+    #[test]
+    fn test_get_option_f64_tuple2_roundtrip() {
+        let mut options = HashMap::new();
+        let value: OwnedValue = Value::from((12.5f64, 42.25f64)).try_into().unwrap();
+        options.insert("cursor_position".to_string(), value);
+
+        let parsed = InputCaptureInterface::get_option_f64_tuple2(&options, "cursor_position");
+        assert_eq!(parsed, Some((12.5, 42.25)));
     }
 
     #[test]

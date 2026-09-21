@@ -38,7 +38,7 @@ use reis::{
 
 use crate::{
     error::{PortalError, Result},
-    types::{DeviceTypes, PointerRegion},
+    types::{DeviceTypes, InputCaptureZone, PointerRegion},
 };
 
 /// Per-session EIS state.
@@ -60,12 +60,15 @@ pub struct EisSession {
     /// forward the cached compositor keymap into a receiver-context
     /// keyboard device.
     shared_wayland_state: Option<Arc<std::sync::Mutex<crate::wayland::SharedWaylandState>>>,
-    /// Regions to advertise on a `PointerAbsolute`-capable device, one per known
-    /// output, read once at session-creation time
-    /// (`WlrInputBackend::pointer_regions`, which never returns empty: a single
-    /// fallback region covers the no-outputs-known-yet case, since it is a libei
+    /// Regions to advertise on a sender-context `PointerAbsolute` device, one per
+    /// known output, read once at session-creation time. Receiver contexts replace
+    /// these with regions derived from the InputCapture portal's logical zones at
+    /// handshake time, so `GetZones` and EIS expose the same coordinate space.
+    ///
+    /// `WlrInputBackend::pointer_regions` never returns empty: a single fallback
+    /// region covers the no-outputs-known-yet case, since it is a libei
     /// implementation bug to advertise the absolute-pointer capability on a
-    /// virtual device without advertising at least one region).
+    /// virtual device without advertising at least one region.
     pointer_regions: Vec<PointerRegion>,
     /// Leftover, not-yet-a-full-click fraction of `ei_scroll.scroll_discrete`'s
     /// wire value (which the libei protocol defines as "fractions or multiples
@@ -121,6 +124,16 @@ impl EisSession {
     ) -> Result<(Self, OwnedFd)> {
         let (server_socket, client_socket) = UnixStream::pair().map_err(|e| {
             PortalError::EisCreationFailed(format!("Failed to create socket pair: {e}"))
+        })?;
+
+        // `process()` is driven by the portal's periodic input-event pump.
+        // It must never block that async task while no client data is ready;
+        // without non-blocking mode the first idle EIS session would prevent
+        // every other session from progressing through its handshake.
+        server_socket.set_nonblocking(true).map_err(|e| {
+            PortalError::EisCreationFailed(format!(
+                "Failed to set EIS server socket non-blocking: {e}"
+            ))
         })?;
 
         let eis_context = eis::Context::new(server_socket).map_err(|e| {
@@ -256,6 +269,35 @@ impl EisSession {
         Ok(vec![])
     }
 
+    /// Select the coordinate regions appropriate for the negotiated EIS
+    /// direction. InputCapture receivers share the portal's logical zones;
+    /// RemoteDesktop senders retain their ScreenCast stream regions.
+    fn pointer_regions_for_context(&self, is_receiver: bool) -> Vec<PointerRegion> {
+        if !is_receiver {
+            return self.pointer_regions.clone();
+        }
+
+        let Some(shared_wayland_state) = &self.shared_wayland_state else {
+            return self.pointer_regions.clone();
+        };
+        let Ok(shared_wayland_state) = shared_wayland_state.lock() else {
+            tracing::warn!(
+                "Could not read InputCapture zones for EIS receiver; using fallback regions"
+            );
+            return self.pointer_regions.clone();
+        };
+        let regions = input_capture_pointer_regions(&shared_wayland_state.zones);
+        if regions.is_empty() {
+            return self.pointer_regions.clone();
+        }
+
+        tracing::debug!(
+            regions = ?regions,
+            "Using InputCapture logical zones for receiver EIS regions"
+        );
+        regions
+    }
+
     /// Transition from handshake to active phase.
     ///
     /// Creates the request converter, adds a seat with the requested capabilities,
@@ -291,13 +333,21 @@ impl EisSession {
         // keymap degrades gracefully (the client just gets raw keycodes
         // with no defined interpretation), it never fails the handshake.
         let shared_wayland_state = self.shared_wayland_state.clone();
+        // InputCapture's GetZones and an EIS receiver must use the same logical
+        // coordinate space. The wlr regions passed to `new` describe ScreenCast
+        // streams instead; with no streams they are the 1920x1080 fallback, which
+        // made HiDPI InputCapture clients such as Deskflow calculate the wrong
+        // screen edge. Snapshot the current portal zones at handshake completion.
+        // Sender contexts retain the stream-derived regions and mapping IDs needed
+        // by RemoteDesktop.
+        let pointer_regions = self.pointer_regions_for_context(is_receiver);
+
         // It is a libei implementation bug to advertise the absolute-pointer
         // capability on a virtual device without advertising at least one region
-        // (`self.pointer_regions` is never empty, see `WlrInputBackend::pointer_regions`).
+        // (`pointer_regions` is never empty, see `WlrInputBackend::pointer_regions`).
         // Regions (and their optional `region_mapping_id`, which must precede the
         // `region` event it tags) must be sent before `ei_device.done`, so like the
         // keyboard keymap below, this has to happen in this construction closure.
-        let pointer_regions = self.pointer_regions.clone();
         let device = seat.add_device(
             Some("portal-device"),
             eis::device::DeviceType::Virtual,
@@ -510,6 +560,36 @@ impl EisSession {
         Ok(())
     }
 
+    /// Send one pointer-button press/release to the client.
+    pub fn send_pointer_button(
+        &mut self,
+        button_code: u32,
+        pressed: bool,
+        time_usec: u64,
+    ) -> Result<()> {
+        let SessionPhase::ActiveReceiver { device, .. } = &self.phase else {
+            return Err(PortalError::InvalidState {
+                expected: "receiver-context EIS session, active".to_string(),
+                actual: "session not in an active receiver phase".to_string(),
+            });
+        };
+        let Some(button) = device.interface::<eis::Button>() else {
+            return Err(PortalError::InvalidState {
+                expected: "device with button capability bound".to_string(),
+                actual: "device has no ei_button interface".to_string(),
+            });
+        };
+        let state = if pressed {
+            eis::button::ButtonState::Press
+        } else {
+            eis::button::ButtonState::Released
+        };
+        button.button(button_code, state);
+        device.frame(time_usec);
+        let _ = self.context.flush();
+        Ok(())
+    }
+
     /// Send one key press/release to the client.
     ///
     /// # Errors
@@ -626,6 +706,37 @@ impl EisSession {
         let _ = self.context.flush();
         Ok(())
     }
+}
+
+/// Convert the zones exposed by `InputCapture.GetZones` into EIS absolute-pointer
+/// regions in that same logical coordinate space.
+///
+/// Portal zones may use negative compositor-global positions when an output is to
+/// the left of or above the primary output. EIS offsets are unsigned, so shift the
+/// whole layout to its own top-left origin while preserving every zone's relative
+/// placement. InputCapture has no associated ScreenCast stream, hence no mapping
+/// ID. Its geometry is already logical, so its physical scale is informationally
+/// neutral here rather than being applied to the dimensions a second time.
+fn input_capture_pointer_regions(zones: &[InputCaptureZone]) -> Vec<PointerRegion> {
+    let Some((origin_x, origin_y)) = zones
+        .iter()
+        .map(|zone| (zone.x, zone.y))
+        .reduce(|(min_x, min_y), (x, y)| (min_x.min(x), min_y.min(y)))
+    else {
+        return Vec::new();
+    };
+
+    zones
+        .iter()
+        .map(|zone| PointerRegion {
+            mapping_id: None,
+            offset_x: u32::try_from(i64::from(zone.x) - i64::from(origin_x)).unwrap_or(u32::MAX),
+            offset_y: u32::try_from(i64::from(zone.y) - i64::from(origin_y)).unwrap_or(u32::MAX),
+            width: zone.width,
+            height: zone.height,
+            scale: 1.0,
+        })
+        .collect()
 }
 
 /// `ei_text.utf8`'s wire cap: 255 bytes including the NUL terminator, so
@@ -763,6 +874,97 @@ mod tests {
     }
 
     #[test]
+    fn test_input_capture_regions_use_get_zones_logical_geometry() {
+        let regions = input_capture_pointer_regions(&[InputCaptureZone {
+            width: 2560,
+            height: 1080,
+            x: 0,
+            y: 0,
+        }]);
+
+        assert_eq!(
+            regions,
+            vec![PointerRegion {
+                mapping_id: None,
+                offset_x: 0,
+                offset_y: 0,
+                width: 2560,
+                height: 1080,
+                scale: 1.0,
+            }]
+        );
+    }
+
+    #[test]
+    fn test_input_capture_regions_preserve_layout_with_negative_coordinates() {
+        let regions = input_capture_pointer_regions(&[
+            InputCaptureZone {
+                width: 1280,
+                height: 1024,
+                x: -1280,
+                y: 56,
+            },
+            InputCaptureZone {
+                width: 2560,
+                height: 1440,
+                x: 0,
+                y: 0,
+            },
+        ]);
+
+        assert_eq!(regions.len(), 2);
+        assert_eq!((regions[0].offset_x, regions[0].offset_y), (0, 56));
+        assert_eq!((regions[0].width, regions[0].height), (1280, 1024));
+        assert_eq!((regions[1].offset_x, regions[1].offset_y), (1280, 0));
+        assert_eq!((regions[1].width, regions[1].height), (2560, 1440));
+    }
+
+    #[test]
+    fn test_input_capture_regions_empty_when_get_zones_is_empty() {
+        assert!(input_capture_pointer_regions(&[]).is_empty());
+    }
+
+    #[test]
+    fn test_receiver_selects_input_capture_regions_but_sender_keeps_stream_regions() {
+        let stream_regions = vec![PointerRegion {
+            mapping_id: Some("output:DP-1".to_string()),
+            offset_x: 0,
+            offset_y: 0,
+            width: 1920,
+            height: 1080,
+            scale: 1.0,
+        }];
+        let shared_state = Arc::new(std::sync::Mutex::new(crate::wayland::SharedWaylandState {
+            zones: vec![InputCaptureZone {
+                width: 2560,
+                height: 1080,
+                x: 0,
+                y: 0,
+            }],
+            ..Default::default()
+        }));
+        let (session, _fd) = EisSession::new(
+            DeviceTypes::all(),
+            Some(shared_state),
+            stream_regions.clone(),
+        )
+        .unwrap();
+
+        assert_eq!(session.pointer_regions_for_context(false), stream_regions);
+        assert_eq!(
+            session.pointer_regions_for_context(true),
+            vec![PointerRegion {
+                mapping_id: None,
+                offset_x: 0,
+                offset_y: 0,
+                width: 2560,
+                height: 1080,
+                scale: 1.0,
+            }]
+        );
+    }
+
+    #[test]
     fn test_accumulate_scroll_discrete_single_click_is_immediate() {
         let (mut session, _fd) = EisSession::new(DeviceTypes::all(), None, Vec::new()).unwrap();
         // One full wheel click on each axis, per the libei wire convention
@@ -814,6 +1016,7 @@ mod tests {
         assert!(session.start_emulating().is_err());
         assert!(session.stop_emulating().is_err());
         assert!(session.send_pointer_motion(1.0, 2.0, 0).is_err());
+        assert!(session.send_pointer_button(0x110, true, 0).is_err());
         assert!(session.send_key(30, true, 0).is_err());
         assert!(session.send_modifiers(0, 0, 0, 0).is_err());
         assert!(session.send_text_utf8("hello").is_err());

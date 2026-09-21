@@ -154,6 +154,27 @@ impl OutputInfo {
             source_type: crate::types::SourceType::Monitor,
         }
     }
+
+    /// Geometry exported through the InputCapture portal.
+    ///
+    /// `wl_output.mode` dimensions describe buffer pixels, while pointer
+    /// barriers, layer-shell placement, and `wl_pointer` coordinates use the
+    /// compositor's logical coordinate space.  Advertising the former makes
+    /// an application calculate barriers and Release cursor positions beyond
+    /// the actual Wayland surface on HiDPI outputs (e.g. 5120x2160 instead of
+    /// 2560x1080 at scale 2).
+    fn input_capture_zone(&self) -> InputCaptureZone {
+        let scale = u32::try_from(self.scale.max(1)).unwrap_or(1);
+        InputCaptureZone {
+            width: (self.width / scale).max(1),
+            height: (self.height / scale).max(1),
+            // wl_output.geometry positions are already in the compositor's
+            // global layout coordinate space; only mode dimensions are
+            // buffer-scaled.
+            x: self.x,
+            y: self.y,
+        }
+    }
 }
 
 /// Shared Wayland state holding all bound globals and protocol objects.
@@ -231,12 +252,7 @@ impl WaylandState {
             .filter_map(|(_, info)| {
                 let info = info.lock().ok()?;
                 if info.done && info.width > 0 && info.height > 0 {
-                    Some(InputCaptureZone {
-                        width: info.width,
-                        height: info.height,
-                        x: info.x,
-                        y: info.y,
-                    })
+                    Some(info.input_capture_zone())
                 } else {
                     None
                 }
@@ -257,15 +273,7 @@ impl WaylandState {
             .filter_map(|(_, info)| {
                 let info = info.lock().ok()?;
                 if info.done && info.width > 0 && info.height > 0 {
-                    Some((
-                        info.global_name,
-                        InputCaptureZone {
-                            width: info.width,
-                            height: info.height,
-                            x: info.x,
-                            y: info.y,
-                        },
-                    ))
+                    Some((info.global_name, info.input_capture_zone()))
                 } else {
                     None
                 }
@@ -391,6 +399,18 @@ impl Dispatch<WlPointer, ()> for WaylandState {
             }
             Event::Leave { surface, .. } => {
                 state.input_capture.on_pointer_leave(&surface);
+            }
+            Event::Button {
+                time,
+                button,
+                state: wayland_client::WEnum::Value(button_state),
+                ..
+            } => {
+                use wayland_client::protocol::wl_pointer::ButtonState;
+                let pressed = button_state != ButtonState::Released;
+                state
+                    .input_capture
+                    .on_pointer_button(button, pressed, u64::from(time) * 1000);
             }
             _ => {}
         }
@@ -1358,15 +1378,29 @@ mod tests {
             done: true,
             ..Default::default()
         };
-        let zone = crate::types::InputCaptureZone {
-            width: info.width,
-            height: info.height,
-            x: info.x,
-            y: info.y,
-        };
+        let zone = info.input_capture_zone();
         assert_eq!(zone.width, 2560);
         assert_eq!(zone.height, 1440);
         assert_eq!(zone.x, 1920);
+        assert_eq!(zone.y, 0);
+    }
+
+    #[test]
+    fn test_input_capture_zone_uses_logical_output_size() {
+        let info = OutputInfo {
+            width: 5120,
+            height: 2160,
+            x: 0,
+            y: 0,
+            scale: 2,
+            done: true,
+            ..Default::default()
+        };
+
+        let zone = info.input_capture_zone();
+        assert_eq!(zone.width, 2560);
+        assert_eq!(zone.height, 1080);
+        assert_eq!(zone.x, 0);
         assert_eq!(zone.y, 0);
     }
 }

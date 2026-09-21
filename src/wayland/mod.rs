@@ -179,6 +179,10 @@ pub enum InputCaptureCommand {
     ReleaseActiveLock {
         /// Session handle.
         session_id: String,
+        /// Keep the compositor-level pointer lock armed after ending the
+        /// portal activation. The next outward motion re-triggers the
+        /// barrier immediately; any other motion releases the lock.
+        preserve_barrier_lock: bool,
     },
 }
 
@@ -747,7 +751,7 @@ impl WaylandConnection {
                 .input_capture
                 .surfaces
                 .values()
-                .find(|s| s.relative_pointer.is_some())
+                .find(|s| s.relative_pointer.is_some() && s.capture_active)
                 .and_then(|s| {
                     s.last_cursor_position
                         .map(|(x, y)| (s.session_id.clone(), x, y))
@@ -1073,8 +1077,13 @@ impl WaylandConnection {
                 InputCaptureCommand::DestroySession { session_id } => {
                     self.state.input_capture.destroy_session(&session_id);
                 }
-                InputCaptureCommand::ReleaseActiveLock { session_id } => {
-                    self.state.input_capture.release_active_locks(&session_id);
+                InputCaptureCommand::ReleaseActiveLock {
+                    session_id,
+                    preserve_barrier_lock,
+                } => {
+                    self.state
+                        .input_capture
+                        .release_active_locks(&session_id, preserve_barrier_lock);
                 }
             }
         }
